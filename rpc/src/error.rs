@@ -5,8 +5,15 @@ use thiserror::Error;
 pub enum RpcError {
     #[error("Parse error")]
     Parse,
+
     #[error("Provider error")]
     Provider,
+
+    #[error("Unknown error")]
+    Unknown,
+
+    #[error("Internal error")]
+    Internal,
 }
 
 pub type RpcReport = Report<RpcError>;

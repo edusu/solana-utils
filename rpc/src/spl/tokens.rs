@@ -7,11 +7,24 @@ use crate::{
     error::{RpcError, RpcResult},
     spl::{
         fetch_multiple_accounts_chunked,
-        utils::{hardcoded_token_data_for_mint, unique_pubkeys},
+        utils::{
+            collect_mints_for_program, hardcoded_token_data_for_mint, unique_pubkeys,
+            validate_supported_token_programs,
+        },
     },
 };
 use anchor_lang::prelude::Pubkey;
-use anchor_spl::{token, token_2022};
+use anchor_lang::solana_program::program_pack::Pack;
+use anchor_spl::{
+    token::{self, spl_token},
+    token_2022::{
+        self,
+        spl_token_2022::{
+            extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensionsOwned},
+            state::{Account as Token2022Account, Mint as Token2022Mint},
+        },
+    },
+};
 use error_stack::{Report, ResultExt};
 use solana_account::Account;
 use solana_keypair::Address;
@@ -52,7 +65,10 @@ pub struct SolanaTokenData {
     pub account_len: usize,
 }
 
-pub async fn get_token_accounts_by_owner(client: &RpcClient, owner: &Pubkey) -> RpcResult<()> {
+pub async fn get_token_accounts_by_owner(
+    client: &RpcClient,
+    owner: &Pubkey,
+) -> RpcResult<HashMap<Address, (SolanaTokenData, SolanaWalletTokenBalance)>> {
     let wallet_address = Address::from(owner.to_bytes());
 
     // Collect every mint currently owned by the wallet across both token programs.
@@ -73,7 +89,20 @@ pub async fn get_token_accounts_by_owner(client: &RpcClient, owner: &Pubkey) -> 
         }
     }
 
-    todo!()
+    let tokens_by_mint = get_tokens_data(&client, mints.into_iter().collect())
+        .await
+        .expect("live token metadata should load");
+
+    let mut balances = get_wallet_token_balances(&client, *owner, tokens_by_mint.clone())
+        .await
+        .expect("live wallet balances should aggregate");
+
+    let merged = tokens_by_mint
+        .into_iter()
+        .filter_map(|(key, y)| balances.remove(&key).map(|z| (key, (y, z))))
+        .collect();
+
+    Ok(merged)
 }
 
 /// Parses the JSON payload returned by `getTokenAccountsByOwner` into raw balance fields.
@@ -253,13 +282,208 @@ async fn check_token_data(
     token_mint: &Pubkey,
     account_info: Account,
 ) -> RpcResult<SolanaTokenData> {
-    todo!()
+    // The program that owns the mint account tells us which token layout to parse.
+    // We intentionally reject any other owner so pricing/wallet flows never operate
+    // on data produced by an unrelated program.
+    if account_info.owner == token::ID {
+        // Classic SPL Token: fixed-size mint layout and fixed-size token accounts.
+        let mint = spl_token::state::Mint::unpack(&account_info.data)
+            .change_context(RpcError::Parse)
+            .attach(format!(
+                "Failed to unpack SPL token mint for {}",
+                token_mint
+            ))?;
+
+        Ok(SolanaTokenData {
+            program_id: token::ID,
+            decimals: mint.decimals,
+            account_len: token::TokenAccount::LEN,
+        })
+    } else if account_info.owner == token_2022::ID {
+        // Token-2022 mints carry a TLV extension list after the base state. Token accounts
+        // created against such a mint must include the matching account-side extensions,
+        // so the ATA size depends on the mint's configuration rather than being a constant.
+        let mint_state = StateWithExtensionsOwned::<Token2022Mint>::unpack(account_info.data)
+            .map_err(|err| {
+                Report::new(RpcError::Parse).attach(format!(
+                    "Failed to unpack Token-2022 mint for {}: {}",
+                    token_mint, err
+                ))
+            })?;
+
+        let mint_extension_types = mint_state.get_extension_types().map_err(|err| {
+            Report::new(RpcError::Parse).attach(format!(
+                "Failed to read Token-2022 mint extensions for {}: {}",
+                token_mint, err
+            ))
+        })?;
+
+        // Translate mint-side extensions into the account-side extensions required at init.
+        let account_extension_types =
+            ExtensionType::get_required_init_account_extensions(&mint_extension_types);
+
+        let account_len =
+            ExtensionType::try_calculate_account_len::<Token2022Account>(&account_extension_types)
+                .map_err(|err| {
+                    Report::new(RpcError::Parse).attach(format!(
+                        "Failed to calculate Token-2022 account length for mint {}: {}",
+                        token_mint, err
+                    ))
+                })?;
+
+        Ok(SolanaTokenData {
+            program_id: token_2022::ID,
+            decimals: mint_state.base.decimals,
+            account_len,
+        })
+    } else {
+        Err(Report::new(RpcError::Parse).attach(format!(
+            "Unsupported token program {} owns mint {}",
+            account_info.owner, token_mint
+        )))
+    }
+}
+
+/// Fetches every token account owned by a wallet for the requested mints and aggregates balances.
+///
+/// # Parameters
+///
+/// * `client` - RPC client used to query token accounts owned by the wallet.
+/// * `wallet` - Wallet owner whose token accounts should be aggregated.
+/// * `tokens_by_mint` - Requested mint metadata keyed by mint address.
+///
+/// # Returns
+///
+/// A map keyed by mint containing the raw summed balance and the per-account breakdown.
+pub async fn get_wallet_token_balances(
+    client: &RpcClient,
+    wallet: Pubkey,
+    tokens_by_mint: HashMap<Pubkey, SolanaTokenData>,
+) -> RpcResult<HashMap<Pubkey, SolanaWalletTokenBalance>> {
+    let wallet_address = Address::from(wallet.to_bytes());
+
+    validate_supported_token_programs(&tokens_by_mint)?;
+
+    let mut balances = tokens_by_mint
+        .iter()
+        .map(|(mint, token_data)| {
+            (
+                *mint,
+                SolanaWalletTokenBalance {
+                    token_data: *token_data,
+                    total_amount_raw: 0,
+                    accounts: Vec::new(),
+                },
+            )
+        })
+        .collect::<HashMap<Pubkey, SolanaWalletTokenBalance>>();
+
+    let legacy_mints = collect_mints_for_program(&tokens_by_mint, token::ID);
+    let token_2022_mints = collect_mints_for_program(&tokens_by_mint, token_2022::ID);
+    let (legacy_keyed_accounts, token_2022_keyed_accounts) = tokio::try_join!(
+        fetch_wallet_token_accounts_by_program(
+            client,
+            &wallet_address,
+            token::ID,
+            legacy_mints.is_empty(),
+        ),
+        fetch_wallet_token_accounts_by_program(
+            client,
+            &wallet_address,
+            token_2022::ID,
+            token_2022_mints.is_empty(),
+        ),
+    )?;
+
+    accumulate_wallet_token_balances(&mut balances, &legacy_mints, legacy_keyed_accounts).await?;
+    accumulate_wallet_token_balances(&mut balances, &token_2022_mints, token_2022_keyed_accounts)
+        .await?;
+
+    Ok(balances)
+}
+
+/// Fetches every token account owned by a wallet for one token program.
+///
+/// # Parameters
+///
+/// * `client` - RPC client used to query token accounts owned by the wallet.
+/// * `wallet_address` - Wallet owner encoded in the RPC address type.
+/// * `wallet` - Wallet owner used for context-rich error messages.
+/// * `program_id` - Token program whose owned accounts should be returned.
+/// * `skip_fetch` - When `true`, avoids issuing an RPC request and returns an empty list.
+///
+/// # Returns
+///
+/// A vector with every RPC token account owned by `wallet` for the selected token program.
+async fn fetch_wallet_token_accounts_by_program(
+    client: &RpcClient,
+    wallet_address: &Address,
+    program_id: Pubkey,
+    skip_fetch: bool,
+) -> RpcResult<Vec<RpcKeyedAccount>> {
+    if skip_fetch {
+        return Ok(Vec::new());
+    }
+
+    client
+        .get_token_accounts_by_owner(
+            wallet_address,
+            TokenAccountsFilter::ProgramId(Address::from(program_id.to_bytes())),
+        )
+        .await
+        .change_context(RpcError::Provider)
+}
+
+/// Parses one JSON-parsed RPC token account and folds it into the aggregated mint balances.
+async fn accumulate_wallet_token_balances(
+    balances_by_mint: &mut HashMap<Pubkey, SolanaWalletTokenBalance>,
+    requested_mints: &HashSet<Pubkey>,
+    keyed_accounts: Vec<RpcKeyedAccount>,
+) -> RpcResult<()> {
+    for keyed_account in keyed_accounts {
+        let parsed_account = parse_rpc_token_account(keyed_account)?;
+        if !requested_mints.contains(&parsed_account.mint) {
+            continue;
+        }
+
+        let Some(balance) = balances_by_mint.get_mut(&parsed_account.mint) else {
+            continue;
+        };
+
+        balance.total_amount_raw = balance
+            .total_amount_raw
+            .checked_add(parsed_account.amount_raw)
+            .ok_or_else(|| {
+                Report::new(RpcError::Internal).attach(format!(
+                    "Overflow while summing wallet balances for mint {}",
+                    parsed_account.mint
+                ))
+            })?;
+        balance.accounts.push(SolanaTokenAccountBalance {
+            token_account: parsed_account.token_account,
+            amount_raw: parsed_account.amount_raw,
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::rpc::create_rpc_client;
+
     use super::*;
 
-    // #[tokio::test]
-    // async fn test_get_token_accounts_by_owner() {}
+    #[tokio::test]
+    async fn test_get_token_accounts_by_owner() {
+        let test_acc = Pubkey::from_str("7kDXEH3xPS5TvScR1czWvSCJMaeHHB9693mWTrdTRQVB").unwrap();
+
+        let client = create_rpc_client(None);
+
+        let result = get_token_accounts_by_owner(&client, &test_acc).await;
+
+        assert!(result.is_ok());
+        let balances = result.unwrap();
+        println!("Token balances for {}: {:#?}", test_acc, balances);
+    }
 }

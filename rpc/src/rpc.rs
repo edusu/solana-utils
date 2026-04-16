@@ -3,9 +3,7 @@ use solana_keypair::Keypair;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use std::sync::Arc;
 
-use crate::rpc;
-
-fn create_client(
+pub fn create_client(
     private_key: &str,
     rpc_and_ws_url: Option<(String, String)>,
 ) -> Client<Arc<Keypair>> {
@@ -20,7 +18,7 @@ fn create_client(
     client
 }
 
-fn create_rpc_client(rpc_url: Option<String>) -> RpcClient {
+pub fn create_rpc_client(rpc_url: Option<String>) -> RpcClient {
     let rpc_url = rpc_url.unwrap_or_else(|| "https://api.mainnet-beta.solana.com".to_string());
     RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed())
 }
