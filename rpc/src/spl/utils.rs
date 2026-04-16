@@ -1,18 +1,8 @@
 use anchor_lang::prelude::Pubkey;
-use anchor_spl::{
-    token::{self, TokenAccount},
-    token_2022,
-};
-use error_stack::Report;
-use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-};
+use anchor_spl::token::TokenAccount;
+use std::{collections::HashSet, str::FromStr};
 
-use crate::{
-    error::{RpcError, RpcResult},
-    spl::tokens::SolanaTokenData,
-};
+use crate::spl::tokens::SolanaTokenData;
 
 /// Number of decimal places used by native SOL balances.
 pub const SOLANA_NATIVE_TOKEN_DECIMALS: u8 = 9;
@@ -70,34 +60,4 @@ pub fn hardcoded_token_data_for_mint(token_mint: &Pubkey) -> Option<SolanaTokenD
 /// Checks whether a mint address is a known native SOL representation (WSOL or the SOL alias).
 pub fn is_native_sol_mint(mint: &Pubkey) -> bool {
     *mint == solana_wsol_mint() || *mint == solana_native_wrapped_mint_alias()
-}
-
-/// Validates that every requested mint uses a supported token program.
-pub fn validate_supported_token_programs(
-    tokens_by_mint: &HashMap<Pubkey, SolanaTokenData>,
-) -> RpcResult<()> {
-    for token_data in tokens_by_mint.values() {
-        validate_token_program(token_data.program_id)?;
-    }
-
-    Ok(())
-}
-
-pub fn validate_token_program(program_id: Pubkey) -> RpcResult<()> {
-    if program_id != token::ID && program_id != token_2022::ID {
-        Err(Report::new(RpcError::Unknown).attach(format!("Unknown token program {program_id}")))
-    } else {
-        Ok(())
-    }
-}
-
-/// Collects the subset of requested mints that belong to one token program.
-pub fn collect_mints_for_program(
-    tokens_by_mint: &HashMap<Pubkey, SolanaTokenData>,
-    program_id: Pubkey,
-) -> HashSet<Pubkey> {
-    tokens_by_mint
-        .iter()
-        .filter_map(|(mint, token_data)| (token_data.program_id == program_id).then_some(*mint))
-        .collect()
 }

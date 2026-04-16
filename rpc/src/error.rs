@@ -9,9 +9,6 @@ pub enum RpcError {
     #[error("Provider error")]
     Provider,
 
-    #[error("Unknown error")]
-    Unknown,
-
     #[error("Internal error")]
     Internal,
 }
