@@ -1,0 +1,6 @@
+[close_accounts]
+# Mints whose token accounts should NEVER be closed.
+# WSOL is already filtered internally; listing it here is cosmetic but documents intent.
+whitelist_mints = [
+    "So11111111111111111111111111111111111111112",
+]

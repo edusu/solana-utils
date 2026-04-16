@@ -5,6 +5,7 @@ use anchor_spl::{
     token_2022::{self, spl_token_2022},
 };
 use error_stack::{Report, ResultExt};
+use futures::future::try_join_all;
 use solana_keypair::{Keypair, Signature};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 
@@ -69,36 +70,46 @@ pub async fn close_token_accounts(
         .map(|account| build_close_instruction(account, &authority_pubkey, &destination))
         .collect::<RpcResult<Vec<_>>>()?;
 
-    let mut signatures = Vec::with_capacity(instructions.len().div_ceil(MAX_CLOSE_IXS_PER_TX));
-    for batch in instructions.chunks(MAX_CLOSE_IXS_PER_TX) {
-        // Each batch fetches its own blockhash so long-running runs don't reuse a stale one
-        // that could be rejected as too old.
-        let recent_blockhash = client
-            .get_latest_blockhash()
-            .await
-            .change_context(RpcError::Provider)
-            .attach("Failed to fetch recent blockhash for close-accounts batch")?;
+    // One blockhash shared across all batches. A blockhash is valid for ~60 seconds,
+    // more than enough to sign + submit 10-20 parallel transactions.
+    let recent_blockhash = client
+        .get_latest_blockhash()
+        .await
+        .change_context(RpcError::Provider)
+        .attach("Failed to fetch recent blockhash")?;
 
-        let tx = Transaction::new_signed_with_payer(
-            batch,
-            Some(&authority_pubkey),
-            &[authority],
-            recent_blockhash,
-        );
+    let batches: Vec<Transaction> = instructions
+        .chunks(MAX_CLOSE_IXS_PER_TX)
+        .map(|batch| {
+            Transaction::new_signed_with_payer(
+                batch,
+                Some(&authority_pubkey),
+                &[authority],
+                recent_blockhash,
+            )
+        })
+        .collect();
 
+    let total_batches = batches.len();
+    tracing::info!(
+        "Submitting {} close-accounts batch transaction(s) in parallel",
+        total_batches
+    );
+
+    // Submit + await confirmation of all batches concurrently. `send_and_confirm_transaction`
+    // polls for confirmation internally; running them in parallel avoids stacking those polls
+    // end-to-end and cuts wall-clock time from ~N*confirmation_time to ~1*confirmation_time.
+    let submissions = batches.iter().enumerate().map(|(index, tx)| async move {
         let signature = client
-            .send_and_confirm_transaction(&tx)
+            .send_and_confirm_transaction(tx)
             .await
             .change_context(RpcError::Provider)
-            .attach(format!(
-                "Failed to send close-accounts batch of {} instructions",
-                batch.len()
-            ))?;
+            .attach(format!("Failed to confirm close-accounts batch {}", index + 1))?;
+        tracing::info!("Batch {}/{} confirmed: {}", index + 1, total_batches, signature);
+        Ok::<Signature, error_stack::Report<RpcError>>(signature)
+    });
 
-        signatures.push(signature);
-    }
-
-    Ok(signatures)
+    try_join_all(submissions).await
 }
 
 /// Decides whether a token account can be closed by the program without failing.

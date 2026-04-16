@@ -6,6 +6,7 @@ use std::{
 use crate::{
     error::{RpcError, RpcResult},
     spl::{
+        close::CloseableTokenAccount,
         fetch_multiple_accounts_chunked,
         utils::{hardcoded_token_data_for_mint, unique_pubkeys},
     },
@@ -370,6 +371,59 @@ fn check_token_data(token_mint: &Pubkey, account_info: Account) -> RpcResult<Sol
             account_info.owner, token_mint
         )))
     }
+}
+
+/// Lists every token account owned by `wallet`, annotated with the program that owns each.
+///
+/// # Parameters
+///
+/// * `client` - RPC client used to list wallet-owned token accounts.
+/// * `wallet` - Wallet whose token accounts should be returned.
+///
+/// # Returns
+///
+/// One record per token account across both SPL token programs. `program_id` is taken
+/// from the per-program query, so no additional lookups are needed to dispatch the
+/// matching close instruction later.
+///
+/// # Assumptions
+///
+/// Unlike [`get_token_accounts_by_owner`], this function does NOT resolve mint metadata —
+/// accounts whose mint has been closed, burned, or is otherwise unloadable are still
+/// included. That makes it the right entry point for closing stale accounts, where
+/// precisely those orphaned records are the ones worth reclaiming rent from.
+pub async fn list_wallet_token_accounts(
+    client: &RpcClient,
+    wallet: &Pubkey,
+) -> RpcResult<Vec<CloseableTokenAccount>> {
+    let wallet_address = Address::from(wallet.to_bytes());
+    let mut accounts = Vec::new();
+
+    for program_id in [token::ID, token_2022::ID] {
+        let keyed_accounts = client
+            .get_token_accounts_by_owner(
+                &wallet_address,
+                TokenAccountsFilter::ProgramId(Address::from(program_id.to_bytes())),
+            )
+            .await
+            .change_context(RpcError::Provider)
+            .attach(format!(
+                "Failed to list token accounts for wallet {} under program {}",
+                wallet, program_id
+            ))?;
+
+        for keyed_account in keyed_accounts {
+            let parsed = parse_rpc_token_account(keyed_account)?;
+            accounts.push(CloseableTokenAccount {
+                token_account: parsed.token_account,
+                program_id,
+                mint: parsed.mint,
+                amount_raw: parsed.amount_raw,
+            });
+        }
+    }
+
+    Ok(accounts)
 }
 
 #[cfg(test)]
