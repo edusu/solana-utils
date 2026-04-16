@@ -9,6 +9,7 @@ use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 
 use crate::error::{RpcError, RpcResult};
 
+pub mod close;
 pub mod tokens;
 pub mod utils;
 
