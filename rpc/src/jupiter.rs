@@ -401,3 +401,247 @@ pub async fn swap_via_rpc(
 
     Ok((signature, order))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spl::utils::SOLANA_WRAPPED_MINT as WSOL_MINT;
+    use solana_keypair::Signer;
+    use std::sync::OnceLock;
+
+    const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    // Jupiter does not validate that the taker actually holds a balance to produce
+    // an /order response, so any valid pubkey works as a placeholder.
+    const TAKER_PLACEHOLDER: &str = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN";
+
+    /// Runs the real `reqwest` query serializer over `request` and returns the
+    /// resulting `key -> value` map — lets tests assert on the wire format
+    /// without duplicating serialization logic.
+    fn query_pairs(request: &OrderRequest) -> HashMap<String, String> {
+        // `reqwest::Client::new()` spins up a TLS config + DNS resolver on each call,
+        // so share one across tests.
+        static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+        let built = CLIENT
+            .get_or_init(reqwest::Client::new)
+            .get("https://example.invalid/order")
+            .query(request)
+            .build()
+            .unwrap();
+        built.url().query_pairs().into_owned().collect()
+    }
+
+    #[test]
+    fn order_request_serializes_required_fields_as_camel_case() {
+        let req = OrderRequest::new(WSOL_MINT, USDC_MINT, 1_000_000, TAKER_PLACEHOLDER);
+        let q = query_pairs(&req);
+
+        assert_eq!(q.get("inputMint").map(String::as_str), Some(WSOL_MINT));
+        assert_eq!(q.get("outputMint").map(String::as_str), Some(USDC_MINT));
+        assert_eq!(q.get("amount").map(String::as_str), Some("1000000"));
+        assert_eq!(q.get("taker").map(String::as_str), Some(TAKER_PLACEHOLDER));
+    }
+
+    #[test]
+    fn order_request_omits_none_optional_fields() {
+        let req = OrderRequest::new(WSOL_MINT, USDC_MINT, 1, TAKER_PLACEHOLDER);
+        let q = query_pairs(&req);
+
+        for key in [
+            "slippageBps",
+            "receiver",
+            "referralAccount",
+            "referralFee",
+            "payer",
+            "excludeRouters",
+        ] {
+            assert!(!q.contains_key(key), "unexpected key {key} in query string");
+        }
+    }
+
+    #[test]
+    fn order_request_includes_optional_fields_when_set() {
+        let mut req = OrderRequest::new(WSOL_MINT, USDC_MINT, 1, TAKER_PLACEHOLDER);
+        req.slippage_bps = Some(150);
+        req.exclude_routers = Some("okx,dflow".into());
+        req.referral_fee = Some(50);
+        let q = query_pairs(&req);
+
+        assert_eq!(q.get("slippageBps").map(String::as_str), Some("150"));
+        assert_eq!(q.get("excludeRouters").map(String::as_str), Some("okx,dflow"));
+        assert_eq!(q.get("referralFee").map(String::as_str), Some("50"));
+    }
+
+    #[test]
+    fn order_response_parses_iris_payload_with_platform_fee_amount() {
+        let body = r#"{
+            "transaction": "AQID",
+            "requestId": "req-iris-1",
+            "outAmount": "987654321",
+            "router": "iris",
+            "mode": "ultra",
+            "feeBps": 5,
+            "feeMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "platformFee": {
+                "amount": "1234",
+                "feeBps": 10,
+                "feeMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            }
+        }"#;
+        let parsed: OrderResponse = serde_json::from_str(body).unwrap();
+
+        assert_eq!(parsed.request_id, "req-iris-1");
+        assert_eq!(parsed.out_amount, "987654321");
+        assert_eq!(parsed.router.as_deref(), Some("iris"));
+        assert_eq!(parsed.transaction.as_deref(), Some("AQID"));
+
+        let fee = parsed.platform_fee.unwrap();
+        assert_eq!(fee.amount.as_deref(), Some("1234"));
+        assert_eq!(fee.fee_bps, 10);
+    }
+
+    // Regression guard: OKX router omits `platformFee.amount`. Making that field
+    // mandatory again would break the swap pipeline for every OKX-routed order.
+    #[test]
+    fn order_response_parses_okx_payload_without_platform_fee_amount() {
+        let body = r#"{
+            "transaction": null,
+            "requestId": "req-okx-1",
+            "outAmount": "42",
+            "router": "okx",
+            "platformFee": {
+                "feeBps": 10,
+                "feeMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            }
+        }"#;
+        let parsed: OrderResponse = serde_json::from_str(body).unwrap();
+
+        assert!(parsed.transaction.is_none());
+        let fee = parsed.platform_fee.unwrap();
+        assert!(fee.amount.is_none(), "amount must stay optional");
+        assert_eq!(fee.fee_bps, 10);
+    }
+
+    #[test]
+    fn price_entry_accepts_entry_with_price_and_decimals() {
+        let entry: PriceEntry =
+            serde_json::from_str(r#"{ "usdPrice": 1.23, "decimals": 6 }"#).unwrap();
+        assert_eq!(entry.usd_price, Some(1.23));
+        assert_eq!(entry.decimals, Some(6));
+    }
+
+    // Price v3 returns metadata-only entries for known mints with no reliable
+    // price (e.g. just `createdAt` + `decimals`). Those must parse cleanly and
+    // be filtered out downstream, not crash the client.
+    #[test]
+    fn price_entry_accepts_entry_without_usd_price() {
+        let entry: PriceEntry =
+            serde_json::from_str(r#"{ "decimals": 9, "createdAt": "2024-01-01" }"#).unwrap();
+        assert!(entry.usd_price.is_none());
+        assert_eq!(entry.decimals, Some(9));
+    }
+
+    #[test]
+    fn price_entry_accepts_entry_without_decimals() {
+        let entry: PriceEntry = serde_json::from_str(r#"{ "usdPrice": 0.5 }"#).unwrap();
+        assert_eq!(entry.usd_price, Some(0.5));
+        assert!(entry.decimals.is_none());
+    }
+
+    // `prices([])` must short-circuit before issuing any HTTP request; if it
+    // didn't, this test would hang or error trying to resolve `127.0.0.1:1`.
+    #[tokio::test]
+    async fn prices_empty_input_skips_http_call() {
+        let client = JupiterClient::new("").with_price_base_url("http://127.0.0.1:1");
+        let out = client
+            .prices(&[])
+            .await
+            .expect("empty input should return Ok(empty map) without network IO");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn decode_transaction_rejects_invalid_base64() {
+        let Err(err) = decode_transaction("not base64!!!") else {
+            panic!("invalid base64 should fail");
+        };
+        assert!(matches!(err.current_context(), RpcError::Parse));
+    }
+
+    #[test]
+    fn decode_transaction_rejects_non_transaction_bytes() {
+        let Err(err) = decode_transaction("AQID") else {
+            panic!("non-transaction bytes should fail");
+        };
+        assert!(matches!(err.current_context(), RpcError::Parse));
+    }
+
+    // Live integration tests hit the real Jupiter API; run with:
+    //     JUP_API_KEY=... cargo test -p rpc -- --ignored --nocapture
+    // When `JUP_API_KEY` is unset they return early instead of failing, so
+    // `cargo test -- --ignored` stays green on machines without a key.
+
+    fn live_client() -> Option<JupiterClient> {
+        std::env::var("JUP_API_KEY").ok().map(JupiterClient::new)
+    }
+
+    #[tokio::test]
+    #[ignore = "hits real Jupiter API"]
+    async fn live_order_quote_sol_to_usdc() {
+        let Some(client) = live_client() else {
+            eprintln!("JUP_API_KEY not set — skipping live test");
+            return;
+        };
+
+        // A freshly generated keypair is enough: Jupiter only checks that `taker`
+        // is a valid base58 pubkey to produce the quote. 0.001 SOL input keeps
+        // the quote small and predictable.
+        let taker = Keypair::new();
+        let request = OrderRequest {
+            slippage_bps: Some(50),
+            ..OrderRequest::new(WSOL_MINT, USDC_MINT, 1_000_000, taker.pubkey().to_string())
+        };
+
+        let response = client
+            .order(&request)
+            .await
+            .expect("live /order should return a quote for SOL → USDC");
+
+        assert!(!response.request_id.is_empty(), "requestId must be populated");
+        assert!(
+            response.transaction.is_some(),
+            "transaction must be present when taker is provided"
+        );
+        let out: u64 = response
+            .out_amount
+            .parse()
+            .expect("outAmount must be a numeric string");
+        assert!(out > 0, "out_amount must be > 0 for a liquid pair");
+    }
+
+    #[tokio::test]
+    #[ignore = "hits real Jupiter API"]
+    async fn live_prices_returns_usdc_and_sol() {
+        let Some(client) = live_client() else {
+            eprintln!("JUP_API_KEY not set — skipping live test");
+            return;
+        };
+
+        let wsol: Pubkey = WSOL_MINT.parse().unwrap();
+        let usdc: Pubkey = USDC_MINT.parse().unwrap();
+        let prices = client
+            .prices(&[wsol, usdc])
+            .await
+            .expect("live /price/v3 should return USD prices for WSOL + USDC");
+
+        let sol = prices.get(&wsol).expect("WSOL must be priced by Jupiter");
+        let stable = prices.get(&usdc).expect("USDC must be priced by Jupiter");
+        assert!(sol.usd_price > 0.0 && sol.decimals == 9);
+        // USDC peg can drift a few bps; sanity bound rather than exact equality.
+        assert!(
+            (0.9..=1.1).contains(&stable.usd_price),
+            "USDC usd_price should stay within ±10% of the peg, got {}",
+            stable.usd_price
+        );
+        assert_eq!(stable.decimals, 6);
+    }
+}

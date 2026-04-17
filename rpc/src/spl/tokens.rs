@@ -440,20 +440,288 @@ pub async fn list_wallet_token_accounts(
 
 #[cfg(test)]
 mod tests {
-    use crate::rpc::create_rpc_client;
-
     use super::*;
+    use crate::rpc::create_rpc_client;
+    use anchor_lang::solana_program::{program_option::COption, program_pack::Pack};
+    use anchor_spl::token::spl_token::state::Mint as SplMint;
+    use serde_json::{Value, json};
+
+    const TOKEN_ACCOUNT_PUBKEY: &str = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1";
+    const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const OWNER_PUBKEY: &str = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+
+    /// Builds a `jsonParsed`-style `RpcKeyedAccount` fixture from an `info` object.
+    ///
+    /// The outer envelope (`pubkey`, `account.lamports`, encoding, etc.) is fixed —
+    /// individual tests only override the inner `info` payload, which is where every
+    /// field `parse_rpc_token_account` looks at lives.
+    fn token_account_fixture(pubkey: &str, info: Value) -> RpcKeyedAccount {
+        let body = json!({
+            "pubkey": pubkey,
+            "account": {
+                "lamports": 2_039_280,
+                "data": {
+                    "program": "spl-token",
+                    "parsed": { "type": "account", "info": info },
+                    "space": 165,
+                },
+                "owner": token::ID.to_string(),
+                "executable": false,
+                "rentEpoch": 0,
+                "space": 165,
+            }
+        });
+        serde_json::from_value(body).unwrap()
+    }
+
+    /// Default `info` payload matching what Solana's RPC emits for an initialized SPL token account.
+    fn default_info(mint: &str) -> Value {
+        json!({
+            "isNative": false,
+            "mint": mint,
+            "owner": OWNER_PUBKEY,
+            "state": "initialized",
+            "tokenAmount": {
+                "amount": "1000",
+                "decimals": 6,
+                "uiAmount": 0.001_f64,
+                "uiAmountString": "0.001",
+            },
+        })
+    }
+
+    #[test]
+    fn parse_rpc_token_account_accepts_valid_initialized_account() {
+        let fixture = token_account_fixture(TOKEN_ACCOUNT_PUBKEY, default_info(USDC_MINT));
+        let parsed = parse_rpc_token_account(fixture).unwrap();
+
+        assert_eq!(
+            parsed.token_account,
+            TOKEN_ACCOUNT_PUBKEY.parse::<Pubkey>().unwrap()
+        );
+        assert_eq!(parsed.mint, USDC_MINT.parse::<Pubkey>().unwrap());
+        assert_eq!(parsed.amount_raw, 1000);
+        assert!(!parsed.is_frozen);
+    }
+
+    #[test]
+    fn parse_rpc_token_account_flags_frozen_state() {
+        let mut info = default_info(USDC_MINT);
+        info["state"] = json!("frozen");
+        let parsed =
+            parse_rpc_token_account(token_account_fixture(TOKEN_ACCOUNT_PUBKEY, info)).unwrap();
+        assert!(parsed.is_frozen);
+    }
+
+    // Guards against RPC implementations that upper-case the state field. The parser
+    // is case-insensitive on purpose.
+    #[test]
+    fn parse_rpc_token_account_flags_frozen_is_case_insensitive() {
+        let mut info = default_info(USDC_MINT);
+        info["state"] = json!("FROZEN");
+        let parsed =
+            parse_rpc_token_account(token_account_fixture(TOKEN_ACCOUNT_PUBKEY, info)).unwrap();
+        assert!(parsed.is_frozen);
+    }
+
+    // Older `jsonParsed` encodings omit the `state` field; treat absence as "not frozen"
+    // rather than erroring out.
+    #[test]
+    fn parse_rpc_token_account_treats_missing_state_as_not_frozen() {
+        let mut info = default_info(USDC_MINT);
+        info.as_object_mut().unwrap().remove("state");
+        let parsed =
+            parse_rpc_token_account(token_account_fixture(TOKEN_ACCOUNT_PUBKEY, info)).unwrap();
+        assert!(!parsed.is_frozen);
+    }
+
+    /// Asserts that parsing a fixture built from `info` produces an `RpcError::Parse`.
+    fn assert_parse_error(info: Value) {
+        let Err(err) = parse_rpc_token_account(token_account_fixture(TOKEN_ACCOUNT_PUBKEY, info))
+        else {
+            panic!("expected Parse error");
+        };
+        assert!(matches!(err.current_context(), RpcError::Parse));
+    }
+
+    /// Asserts that parsing `fixture` (used when the test needs a non-default envelope)
+    /// produces an `RpcError::Parse`.
+    fn assert_parse_error_fixture(fixture: RpcKeyedAccount) {
+        let Err(err) = parse_rpc_token_account(fixture) else {
+            panic!("expected Parse error");
+        };
+        assert!(matches!(err.current_context(), RpcError::Parse));
+    }
+
+    #[test]
+    fn parse_rpc_token_account_rejects_non_json_encoding() {
+        // Base64 encoding instead of jsonParsed: the parser has no structured
+        // fields to extract, so it must fail rather than silently returning zeros.
+        let body = json!({
+            "pubkey": TOKEN_ACCOUNT_PUBKEY,
+            "account": {
+                "lamports": 2_039_280,
+                "data": ["ZGVhZGJlZWY=", "base64"],
+                "owner": token::ID.to_string(),
+                "executable": false,
+                "rentEpoch": 0,
+                "space": 165,
+            }
+        });
+        assert_parse_error_fixture(serde_json::from_value(body).unwrap());
+    }
+
+    #[test]
+    fn parse_rpc_token_account_rejects_non_account_type() {
+        let body = json!({
+            "pubkey": TOKEN_ACCOUNT_PUBKEY,
+            "account": {
+                "lamports": 2_039_280,
+                "data": {
+                    "program": "spl-token",
+                    "parsed": { "type": "mint", "info": {} },
+                    "space": 82,
+                },
+                "owner": token::ID.to_string(),
+                "executable": false,
+                "rentEpoch": 0,
+                "space": 82,
+            }
+        });
+        assert_parse_error_fixture(serde_json::from_value(body).unwrap());
+    }
+
+    #[test]
+    fn parse_rpc_token_account_rejects_missing_mint_field() {
+        let mut info = default_info(USDC_MINT);
+        info.as_object_mut().unwrap().remove("mint");
+        assert_parse_error(info);
+    }
+
+    #[test]
+    fn parse_rpc_token_account_rejects_missing_amount_field() {
+        let mut info = default_info(USDC_MINT);
+        info["tokenAmount"]
+            .as_object_mut()
+            .unwrap()
+            .remove("amount");
+        assert_parse_error(info);
+    }
+
+    #[test]
+    fn parse_rpc_token_account_rejects_non_numeric_amount() {
+        let mut info = default_info(USDC_MINT);
+        info["tokenAmount"]["amount"] = json!("not-a-number");
+        assert_parse_error(info);
+    }
+
+    /// Builds a valid legacy SPL Token Mint account packed into the 82-byte layout.
+    fn legacy_mint_account(decimals: u8) -> Account {
+        let mint = SplMint {
+            mint_authority: COption::None,
+            supply: 1,
+            decimals,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+        let mut data = vec![0u8; SplMint::LEN];
+        SplMint::pack(mint, &mut data).expect("packing a valid mint must succeed");
+        Account {
+            lamports: 1_000_000,
+            data,
+            owner: token::ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn collect_token_data_returns_metadata_for_valid_legacy_mint() {
+        let mint_pk: Pubkey = USDC_MINT.parse().unwrap();
+        let mut accounts = HashMap::new();
+        accounts.insert(mint_pk, Some(legacy_mint_account(6)));
+
+        let out = collect_token_data_from_accounts(&[mint_pk], &accounts);
+
+        assert_eq!(out.len(), 1);
+        let data = out.get(&mint_pk).expect("legacy mint must be included");
+        assert_eq!(data.program_id, token::ID);
+        assert_eq!(data.decimals, 6);
+        assert_eq!(data.account_len, token::TokenAccount::LEN);
+    }
+
+    // Closed / stale mints come back as `None` from `getMultipleAccounts`. We must
+    // skip them rather than fail the whole batch.
+    #[test]
+    fn collect_token_data_skips_missing_account() {
+        let mint_pk: Pubkey = USDC_MINT.parse().unwrap();
+        let mut accounts = HashMap::new();
+        accounts.insert(mint_pk, None);
+
+        let out = collect_token_data_from_accounts(&[mint_pk], &accounts);
+        assert!(out.is_empty());
+    }
+
+    // A mint owned by a program that is not SPL-Token / Token-2022 has no readable
+    // decimals; skip rather than guess.
+    #[test]
+    fn collect_token_data_skips_unsupported_owner() {
+        let mint_pk: Pubkey = USDC_MINT.parse().unwrap();
+        let mut bogus = legacy_mint_account(6);
+        bogus.owner = Pubkey::new_unique();
+        let mut accounts = HashMap::new();
+        accounts.insert(mint_pk, Some(bogus));
+
+        let out = collect_token_data_from_accounts(&[mint_pk], &accounts);
+        assert!(out.is_empty());
+    }
+
+    // SPL-Token owner but garbage bytes → `SplMint::unpack` fails → skipped.
+    #[test]
+    fn collect_token_data_skips_corrupted_legacy_mint_bytes() {
+        let mint_pk: Pubkey = USDC_MINT.parse().unwrap();
+        let corrupted = Account {
+            lamports: 1,
+            data: vec![0xFF; 10],
+            owner: token::ID,
+            executable: false,
+            rent_epoch: 0,
+        };
+        let mut accounts = HashMap::new();
+        accounts.insert(mint_pk, Some(corrupted));
+
+        let out = collect_token_data_from_accounts(&[mint_pk], &accounts);
+        assert!(out.is_empty());
+    }
+
+    // Live integration test hits the public mainnet RPC; run with:
+    //     cargo test -p rpc -- --ignored --nocapture
 
     #[tokio::test]
-    async fn test_get_token_accounts_by_owner() {
-        let test_acc = Pubkey::from_str("7kDXEH3xPS5TvScR1czWvSCJMaeHHB9693mWTrdTRQVB").unwrap();
-
+    #[ignore = "hits public mainnet RPC"]
+    async fn live_get_token_accounts_by_owner() {
+        let wallet = Pubkey::from_str("7kDXEH3xPS5TvScR1czWvSCJMaeHHB9693mWTrdTRQVB").unwrap();
         let client = create_rpc_client(None);
 
-        let result = get_token_accounts_by_owner(&client, &test_acc).await;
+        let balances = get_token_accounts_by_owner(&client, &wallet)
+            .await
+            .expect("mainnet RPC should return token balances");
 
-        assert!(result.is_ok());
-        let balances = result.unwrap();
-        println!("Token balances for {}: {:#?}", test_acc, balances);
+        for (mint, balance) in &balances {
+            let pid = balance.token_data.program_id;
+            assert!(
+                pid == token::ID || pid == token_2022::ID,
+                "unexpected program_id {} for mint {}",
+                pid,
+                mint
+            );
+
+            let per_account_sum: u64 = balance.accounts.iter().map(|a| a.amount_raw).sum();
+            assert_eq!(
+                balance.total_amount_raw, per_account_sum,
+                "total_amount_raw must equal the sum of per-account balances for mint {}",
+                mint
+            );
+        }
     }
 }
