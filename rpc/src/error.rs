@@ -11,6 +11,9 @@ pub enum RpcError {
 
     #[error("Internal error")]
     Internal,
+
+    #[error("Network error")]
+    Network,
 }
 
 pub type RpcReport = Report<RpcError>;

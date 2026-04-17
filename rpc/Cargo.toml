@@ -11,6 +11,12 @@ solana-keypair        = { workspace = true }
 solana-rpc-client     = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-account        = { workspace = true }
+solana-transaction    = { workspace = true }
+solana-message        = { workspace = true }
+
+reqwest  = { workspace = true }
+base64   = { workspace = true }
+bincode  = { workspace = true }
 
 error-stack        = { workspace = true }
 thiserror          = { workspace = true }
