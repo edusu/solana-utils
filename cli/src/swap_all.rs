@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    str::FromStr,
-    time::Duration,
-};
+use std::{collections::HashMap, path::PathBuf, str::FromStr, time::Duration};
 
 use anchor_lang::prelude::Pubkey;
 use clap::Args;
@@ -149,8 +144,7 @@ pub async fn run(args: SwapAllArgs) -> CliResult<()> {
     let candidates = select_swap_candidates(all_accounts, &whitelist, &target);
     tracing::info!("{} mint(s) to process", candidates.len());
 
-    let classification =
-        classify_candidates(candidates, &jupiter, args.min_usd_value).await?;
+    let classification = classify_candidates(candidates, &jupiter, args.min_usd_value).await?;
 
     tracing::info!(
         "Classification: {} swappable | {} to burn+close",
@@ -243,10 +237,9 @@ pub async fn run(args: SwapAllArgs) -> CliResult<()> {
     all_burnable.extend(drain.dust);
 
     if !all_burnable.is_empty() {
-        let signatures =
-            burn_and_close_token_accounts(&rpc, &authority, all_burnable, destination)
-                .await
-                .change_context(CliError::Rpc)?;
+        let signatures = burn_and_close_token_accounts(&rpc, &authority, all_burnable, destination)
+            .await
+            .change_context(CliError::Rpc)?;
         tracing::info!(
             "Submitted {} burn+close batch transaction(s)",
             signatures.len()
@@ -331,25 +324,26 @@ async fn classify_candidates(
 
     let mints: Vec<Pubkey> = candidates.iter().map(|account| account.mint).collect();
 
-    let prices = jupiter
-        .prices(&mints)
-        .await
-        .change_context(CliError::Rpc)?;
+    let prices = jupiter.prices(&mints).await.change_context(CliError::Rpc)?;
 
     let mut classification = Classification::default();
 
     for account in candidates {
         let Some(price_info) = prices.get(&account.mint).copied() else {
-            classification.burnable.push(BurnableCandidate { account, value_usd: None });
+            classification.burnable.push(BurnableCandidate {
+                account,
+                value_usd: None,
+            });
             continue;
         };
 
-        let value_usd = (account.amount_raw as f64
-            / 10f64.powi(price_info.decimals as i32))
+        let value_usd = (account.amount_raw as f64 / 10f64.powi(price_info.decimals as i32))
             * price_info.usd_price;
 
         if value_usd >= min_usd_value {
-            classification.swappable.push(SwappableCandidate { account, value_usd });
+            classification
+                .swappable
+                .push(SwappableCandidate { account, value_usd });
         } else {
             classification.burnable.push(BurnableCandidate {
                 account,
@@ -476,11 +470,7 @@ async fn run_swap_loop(
                 tokio::time::sleep(Duration::from_secs(POST_TX_DELAY_SECS)).await;
             }
             Err(err) => {
-                tracing::warn!(
-                    "RPC submit failed for {}: {:?}",
-                    account.mint,
-                    err
-                );
+                tracing::warn!("RPC submit failed for {}: {:?}", account.mint, err);
             }
         }
     }

@@ -334,7 +334,10 @@ fn check_token_data(token_mint: &Pubkey, account_info: Account) -> RpcResult<Sol
     if account_info.owner == token::ID {
         let mint = spl_token::state::Mint::unpack(&account_info.data)
             .change_context(RpcError::Parse)
-            .attach(format!("Failed to unpack SPL token mint for {}", token_mint))?;
+            .attach(format!(
+                "Failed to unpack SPL token mint for {}",
+                token_mint
+            ))?;
 
         Ok(SolanaTokenData {
             program_id: token::ID,

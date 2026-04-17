@@ -109,8 +109,16 @@ pub async fn close_token_accounts(
             .send_and_confirm_transaction(tx)
             .await
             .change_context(RpcError::Provider)
-            .attach(format!("Failed to confirm close-accounts batch {}", index + 1))?;
-        tracing::info!("Batch {}/{} confirmed: {}", index + 1, total_batches, signature);
+            .attach(format!(
+                "Failed to confirm close-accounts batch {}",
+                index + 1
+            ))?;
+        tracing::info!(
+            "Batch {}/{} confirmed: {}",
+            index + 1,
+            total_batches,
+            signature
+        );
         Ok::<Signature, error_stack::Report<RpcError>>(signature)
     });
 

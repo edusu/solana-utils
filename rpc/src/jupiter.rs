@@ -147,10 +147,8 @@ impl JupiterClient {
                 .attach("Failed to read Jupiter /price response body")?;
 
             if !status.is_success() {
-                return Err(Report::new(RpcError::Provider).attach(format!(
-                    "Jupiter /price returned HTTP {}: {}",
-                    status, body
-                )));
+                return Err(Report::new(RpcError::Provider)
+                    .attach(format!("Jupiter /price returned HTTP {}: {}", status, body)));
             }
 
             // v3 returns a flat map `{ "<mint>": { "usdPrice": 1.23, ... }, ... }`.
@@ -169,7 +167,13 @@ impl JupiterClient {
                     tracing::warn!("Jupiter /price returned unparseable mint {}", mint_str);
                     continue;
                 };
-                out.insert(mint, PriceInfo { usd_price, decimals });
+                out.insert(
+                    mint,
+                    PriceInfo {
+                        usd_price,
+                        decimals,
+                    },
+                );
             }
         }
 
@@ -356,9 +360,8 @@ pub async fn fetch_signed_swap_transaction(
     let order = client.order(request).await?;
 
     let transaction_b64 = order.transaction.as_deref().ok_or_else(|| {
-        Report::new(RpcError::Parse).attach(
-            "Jupiter /order did not return an assembled transaction; was `taker` provided?",
-        )
+        Report::new(RpcError::Parse)
+            .attach("Jupiter /order did not return an assembled transaction; was `taker` provided?")
     })?;
 
     let decoded = decode_transaction(transaction_b64)?;
@@ -467,7 +470,10 @@ mod tests {
         let q = query_pairs(&req);
 
         assert_eq!(q.get("slippageBps").map(String::as_str), Some("150"));
-        assert_eq!(q.get("excludeRouters").map(String::as_str), Some("okx,dflow"));
+        assert_eq!(
+            q.get("excludeRouters").map(String::as_str),
+            Some("okx,dflow")
+        );
         assert_eq!(q.get("referralFee").map(String::as_str), Some("50"));
     }
 
@@ -499,8 +505,6 @@ mod tests {
         assert_eq!(fee.fee_bps, 10);
     }
 
-    // Regression guard: OKX router omits `platformFee.amount`. Making that field
-    // mandatory again would break the swap pipeline for every OKX-routed order.
     #[test]
     fn order_response_parses_okx_payload_without_platform_fee_amount() {
         let body = r#"{
@@ -606,7 +610,10 @@ mod tests {
             .await
             .expect("live /order should return a quote for SOL → USDC");
 
-        assert!(!response.request_id.is_empty(), "requestId must be populated");
+        assert!(
+            !response.request_id.is_empty(),
+            "requestId must be populated"
+        );
         assert!(
             response.transaction.is_some(),
             "transaction must be present when taker is provided"

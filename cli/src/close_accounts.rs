@@ -6,7 +6,7 @@ use error_stack::ResultExt;
 use rpc::{
     rpc::create_rpc_client,
     spl::{
-        close::{close_token_accounts, CloseableTokenAccount},
+        close::{CloseableTokenAccount, close_token_accounts},
         tokens::list_wallet_token_accounts,
         utils::is_native_sol_mint,
     },
@@ -85,10 +85,7 @@ pub async fn run(args: CloseAccountsArgs) -> CliResult<()> {
             .iter()
             .filter(|account| account.amount_raw == 0 && !is_native_sol_mint(&account.mint))
             .collect();
-        tracing::info!(
-            "[dry-run] {} account(s) would be closed:",
-            closeable.len()
-        );
+        tracing::info!("[dry-run] {} account(s) would be closed:", closeable.len());
         for account in &closeable {
             tracing::info!(
                 "  token_account={} mint={} program={}",

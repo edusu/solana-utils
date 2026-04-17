@@ -48,10 +48,8 @@ pub async fn burn_and_close_token_accounts(
     accounts: Vec<CloseableTokenAccount>,
     destination: Pubkey,
 ) -> RpcResult<Vec<Signature>> {
-    let processable: Vec<CloseableTokenAccount> = accounts
-        .into_iter()
-        .filter(is_processable)
-        .collect();
+    let processable: Vec<CloseableTokenAccount> =
+        accounts.into_iter().filter(is_processable).collect();
 
     if processable.is_empty() {
         return Ok(Vec::new());
@@ -99,7 +97,12 @@ pub async fn burn_and_close_token_accounts(
             .await
             .change_context(RpcError::Provider)
             .attach(format!("Failed to confirm burn+close batch {}", index + 1))?;
-        tracing::info!("Batch {}/{} confirmed: {}", index + 1, total_batches, signature);
+        tracing::info!(
+            "Batch {}/{} confirmed: {}",
+            index + 1,
+            total_batches,
+            signature
+        );
         Ok::<Signature, error_stack::Report<RpcError>>(signature)
     });
 
