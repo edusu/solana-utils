@@ -14,6 +14,8 @@ use crate::error::{CliError, CliResult};
 pub struct Config {
     #[serde(default)]
     pub close_accounts: CloseAccountsConfig,
+    #[serde(default)]
+    pub swap_all: SwapAllConfig,
 }
 
 /// Configuration scoped to the `close-accounts` subcommand.
@@ -22,6 +24,16 @@ pub struct Config {
 #[serde(rename_all = "snake_case")]
 pub struct CloseAccountsConfig {
     /// Mint addresses whose token accounts must be skipped by the closer.
+    #[serde(default)]
+    pub whitelist_mints: Vec<String>,
+}
+
+/// Configuration scoped to the `swap-all` subcommand.
+// Derives are used so the section can be deserialised from TOML independently.
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct SwapAllConfig {
+    /// Mint addresses that must never be swapped out of the wallet.
     #[serde(default)]
     pub whitelist_mints: Vec<String>,
 }
@@ -47,6 +59,20 @@ impl Config {
 }
 
 impl CloseAccountsConfig {
+    /// Parses the whitelist entries into `Pubkey`s, deduplicating along the way.
+    pub fn whitelist_pubkeys(&self) -> CliResult<HashSet<Pubkey>> {
+        self.whitelist_mints
+            .iter()
+            .map(|mint| {
+                Pubkey::from_str(mint)
+                    .change_context(CliError::Config)
+                    .attach(format!("Invalid whitelist mint {}", mint))
+            })
+            .collect()
+    }
+}
+
+impl SwapAllConfig {
     /// Parses the whitelist entries into `Pubkey`s, deduplicating along the way.
     pub fn whitelist_pubkeys(&self) -> CliResult<HashSet<Pubkey>> {
         self.whitelist_mints

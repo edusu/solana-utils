@@ -1,6 +1,11 @@
 [close_accounts]
 # Mints whose token accounts should NEVER be closed.
-# WSOL is already filtered internally; listing it here is cosmetic but documents intent.
+whitelist_mints = ["So11111111111111111111111111111111111111112"]
+
+[swap_all]
+# Mints that must NOT be swapped out by `swap-all`.
 whitelist_mints = [
+    "So11111111111111111111111111111111111111111",
     "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
 ]

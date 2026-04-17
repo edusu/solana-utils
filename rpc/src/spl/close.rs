@@ -26,6 +26,11 @@ pub struct CloseableTokenAccount {
     pub program_id: Pubkey,
     pub mint: Pubkey,
     pub amount_raw: u64,
+    /// `true` when the token account has been frozen by the mint's freeze authority.
+    ///
+    /// A frozen account rejects Burn/Transfer, so cleanup flows that depend on
+    /// reaching a zero balance (our burn+close path) must skip it.
+    pub is_frozen: bool,
 }
 
 /// Upper bound for `close_account` instructions per transaction.
@@ -137,7 +142,7 @@ fn is_closeable(account: &CloseableTokenAccount) -> bool {
 }
 
 /// Builds the `close_account` instruction for the token program that owns the account.
-fn build_close_instruction(
+pub(crate) fn build_close_instruction(
     account: &CloseableTokenAccount,
     authority: &Pubkey,
     destination: &Pubkey,

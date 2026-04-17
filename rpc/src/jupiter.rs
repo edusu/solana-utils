@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use anchor_lang::prelude::Pubkey;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use error_stack::{Report, ResultExt};
 use serde::{Deserialize, Serialize};
@@ -10,15 +13,23 @@ use crate::error::{RpcError, RpcResult};
 /// Default host for the production Jupiter Swap v2 API.
 pub const DEFAULT_BASE_URL: &str = "https://api.jup.ag/swap/v2";
 
-/// HTTP client for the Jupiter Swap v2 `/order` endpoint.
+/// Default host for the production Jupiter Price v3 API.
+pub const DEFAULT_PRICE_BASE_URL: &str = "https://api.jup.ag/price/v3";
+
+/// Maximum number of mints accepted by Jupiter's Price v3 API per request.
+const PRICE_BATCH_LIMIT: usize = 50;
+
+/// HTTP client for the Jupiter Swap v2 `/order` and Price v2 endpoints.
 pub struct JupiterClient {
     http: reqwest::Client,
     base_url: String,
+    price_base_url: String,
     api_key: String,
 }
 
 impl JupiterClient {
-    /// Builds a client targeting [`DEFAULT_BASE_URL`] with the given API key.
+    /// Builds a client targeting [`DEFAULT_BASE_URL`] + [`DEFAULT_PRICE_BASE_URL`]
+    /// with the given API key.
     ///
     /// # Parameters
     ///
@@ -27,13 +38,20 @@ impl JupiterClient {
         Self {
             http: reqwest::Client::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
+            price_base_url: DEFAULT_PRICE_BASE_URL.to_string(),
             api_key: api_key.into(),
         }
     }
 
-    /// Overrides the base URL, useful for pointing at `lite-api.jup.ag` or a mock server.
+    /// Overrides the swap base URL (e.g. to point at `lite-api.jup.ag` or a mock server).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Overrides the price base URL.
+    pub fn with_price_base_url(mut self, price_base_url: impl Into<String>) -> Self {
+        self.price_base_url = price_base_url.into();
         self
     }
 
@@ -76,6 +94,107 @@ impl JupiterClient {
             .change_context(RpcError::Parse)
             .attach(format!("Failed to parse Jupiter /order response: {}", body))
     }
+
+    /// Fetches USD prices and decimals for a batch of mints via Jupiter's Price v3 API.
+    ///
+    /// Mints that Jupiter cannot quote (no liquidity, dead pool, frozen, ...) are
+    /// simply absent from the returned map, so callers can use "present" as a
+    /// signal for "routeable" and "missing" for "likely dead".
+    ///
+    /// Entries are also skipped when Jupiter returns metadata but no `usdPrice`
+    /// (known token without a reliable price) or is missing `decimals` — either
+    /// case leaves the caller unable to compute a USD value and should be treated
+    /// the same as "no price".
+    ///
+    /// Large batches are automatically split to respect the API's 50-mint limit.
+    ///
+    /// # Parameters
+    ///
+    /// * `mints` - Mint addresses to quote. Duplicates are de-duplicated by the API.
+    ///
+    /// # Returns
+    ///
+    /// A map from mint to [`PriceInfo`]. Empty on empty input.
+    pub async fn prices(&self, mints: &[Pubkey]) -> RpcResult<HashMap<Pubkey, PriceInfo>> {
+        if mints.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut out: HashMap<Pubkey, PriceInfo> = HashMap::with_capacity(mints.len());
+
+        for chunk in mints.chunks(PRICE_BATCH_LIMIT) {
+            let ids = chunk
+                .iter()
+                .map(|mint| mint.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let response = self
+                .http
+                .get(&self.price_base_url)
+                .header("x-api-key", &self.api_key)
+                .query(&[("ids", ids.as_str())])
+                .send()
+                .await
+                .change_context(RpcError::Network)
+                .attach(format!("Failed to call Jupiter {}", self.price_base_url))?;
+
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .change_context(RpcError::Network)
+                .attach("Failed to read Jupiter /price response body")?;
+
+            if !status.is_success() {
+                return Err(Report::new(RpcError::Provider).attach(format!(
+                    "Jupiter /price returned HTTP {}: {}",
+                    status, body
+                )));
+            }
+
+            // v3 returns a flat map `{ "<mint>": { "usdPrice": 1.23, ... }, ... }`.
+            // The entry itself is present even for mints Jupiter knows but cannot
+            // price — in that case `usdPrice` is absent — so treat "no `usdPrice`"
+            // as "no price", identical to the route-failure path downstream.
+            let parsed: HashMap<String, PriceEntry> = serde_json::from_str(&body)
+                .change_context(RpcError::Parse)
+                .attach(format!("Failed to parse Jupiter /price response: {}", body))?;
+
+            for (mint_str, entry) in parsed {
+                let (Some(usd_price), Some(decimals)) = (entry.usd_price, entry.decimals) else {
+                    continue;
+                };
+                let Ok(mint) = mint_str.parse::<Pubkey>() else {
+                    tracing::warn!("Jupiter /price returned unparseable mint {}", mint_str);
+                    continue;
+                };
+                out.insert(mint, PriceInfo { usd_price, decimals });
+            }
+        }
+
+        Ok(out)
+    }
+}
+
+/// USD price + decimals for one mint, as returned by [`JupiterClient::prices`].
+///
+/// `decimals` comes from Jupiter's indexed metadata so callers computing USD
+/// values don't need a separate on-chain round-trip to the mint.
+// Derives are used so callers can inspect and clone the value without extra plumbing.
+#[derive(Debug, Clone, Copy)]
+pub struct PriceInfo {
+    pub usd_price: f64,
+    pub decimals: u8,
+}
+
+/// Price v3 response entry. Fields other than `usdPrice` and `decimals` are
+/// ignored by this client.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PriceEntry {
+    usd_price: Option<f64>,
+    decimals: Option<u8>,
 }
 
 /// Parameters accepted by `GET /order`.
@@ -165,11 +284,14 @@ pub struct OrderResponse {
 }
 
 /// Platform/referral fee breakdown returned inside [`OrderResponse`].
+///
+/// `amount` is optional because some routers (notably OKX) omit it and only send
+/// `fee_bps` + `fee_mint`.
 // Derives are used so the nested fee block can be inspected and cloned like the parent response.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlatformFee {
-    pub amount: String,
+    pub amount: Option<String>,
     pub fee_bps: u16,
     pub fee_mint: String,
 }

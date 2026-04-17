@@ -51,6 +51,7 @@ struct ParsedRpcTokenAccount {
     token_account: Pubkey,
     mint: Pubkey,
     amount_raw: u64,
+    is_frozen: bool,
 }
 
 /// Describes the mint metadata needed to work with Solana token accounts.
@@ -219,10 +220,20 @@ fn parse_rpc_token_account(keyed_account: RpcKeyedAccount) -> RpcResult<ParsedRp
             amount_str, token_account
         ))?;
 
+    // `state` is emitted by jsonParsed as a lowercase string. Anything other than
+    // `"frozen"` is treated as usable; a missing field (some old encodings) also
+    // implies "not frozen".
+    let is_frozen = info
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .map(|state| state.eq_ignore_ascii_case("frozen"))
+        .unwrap_or(false);
+
     Ok(ParsedRpcTokenAccount {
         token_account,
         mint,
         amount_raw,
+        is_frozen,
     })
 }
 
@@ -419,6 +430,7 @@ pub async fn list_wallet_token_accounts(
                 program_id,
                 mint: parsed.mint,
                 amount_raw: parsed.amount_raw,
+                is_frozen: parsed.is_frozen,
             });
         }
     }

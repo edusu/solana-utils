@@ -1,6 +1,7 @@
 mod close_accounts;
 mod config;
 mod error;
+mod swap_all;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -18,6 +19,8 @@ struct Cli {
 enum Command {
     /// Close all token accounts with zero balance, respecting the whitelist.
     CloseAccounts(close_accounts::CloseAccountsArgs),
+    /// Swap every token balance (except SOL and whitelisted mints) into a target mint via Jupiter, then close the drained accounts.
+    SwapAll(swap_all::SwapAllArgs),
 }
 
 #[tokio::main]
@@ -32,5 +35,6 @@ async fn main() -> CliResult<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::CloseAccounts(args) => close_accounts::run(args).await,
+        Command::SwapAll(args) => swap_all::run(args).await,
     }
 }
