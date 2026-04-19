@@ -13,9 +13,10 @@ Both commands honor a per-section whitelist in `config.toml` and support `--dry-
 
 ## Architecture
 
-Cargo workspace with two crates:
+Cargo workspace with three crates:
 
-- `rpc/` — reusable library: RPC client, SPL operations (list, close, burn), Jupiter client (`/order` and `/price/v3`) with local signing.
+- `rpc/` — Solana-only library: `RpcClient` wrapper, SPL operations (list, close, burn), generic tx signing helper.
+- `integrations/` — third-party HTTP APIs (Jupiter today): Swap v2 `/order`, Price v3, plus helpers that stitch together quote + sign + submit.
 - `cli/` — `solana-utils` binary with subcommands (`clap`), loads `.env` on startup, logs via `tracing`.
 
 Files worth knowing:
@@ -25,13 +26,17 @@ rpc/src/
 ├── spl/tokens.rs    # lists accounts from both programs (Token and Token-2022)
 ├── spl/close.rs     # close in batches of 20 ix/TX
 ├── spl/burn.rs      # burn+close pairs grouped 10 per TX
-└── jupiter.rs       # quote + local signing + send through the caller's RPC
+└── tx.rs            # sign_versioned_transaction (generic signing helper)
+integrations/src/
+└── jupiter.rs       # quote + decode + fetch_signed_swap_transaction + swap_via_rpc
 cli/src/
 ├── close_accounts.rs
 └── swap_all.rs
 ```
 
-Typed errors with `error_stack` (`CliError` wraps `RpcError`).
+Dependency direction: `cli` → `integrations` → `rpc`. The `rpc` crate never depends on `integrations`.
+
+Typed errors with `error_stack`: `CliError` wraps `RpcError` and `IntegrationError`.
 
 ## Requirements
 

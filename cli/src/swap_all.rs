@@ -3,8 +3,8 @@ use std::{collections::HashMap, path::PathBuf, str::FromStr, time::Duration};
 use anchor_lang::prelude::Pubkey;
 use clap::Args;
 use error_stack::ResultExt;
+use integrations::jupiter::{JupiterClient, OrderRequest, fetch_signed_swap_transaction};
 use rpc::{
-    jupiter::{JupiterClient, OrderRequest, fetch_signed_swap_transaction},
     rpc::create_rpc_client,
     spl::{
         burn::burn_and_close_token_accounts,
@@ -324,7 +324,10 @@ async fn classify_candidates(
 
     let mints: Vec<Pubkey> = candidates.iter().map(|account| account.mint).collect();
 
-    let prices = jupiter.prices(&mints).await.change_context(CliError::Rpc)?;
+    let prices = jupiter
+        .prices(&mints)
+        .await
+        .change_context(CliError::Integration)?;
 
     let mut classification = Classification::default();
 

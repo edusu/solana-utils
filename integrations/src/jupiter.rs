@@ -3,12 +3,13 @@ use std::collections::HashMap;
 use anchor_lang::prelude::Pubkey;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use error_stack::{Report, ResultExt};
+use rpc::tx::sign_versioned_transaction;
 use serde::{Deserialize, Serialize};
 use solana_keypair::{Keypair, Signature};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_transaction::versioned::VersionedTransaction;
 
-use crate::error::{RpcError, RpcResult};
+use crate::error::{IntegrationError, IntegrationResult};
 
 /// Default host for the production Jupiter Swap v2 API.
 pub const DEFAULT_BASE_URL: &str = "https://api.jup.ag/swap/v2";
@@ -65,7 +66,7 @@ impl JupiterClient {
     /// # Returns
     ///
     /// The deserialized [`OrderResponse`] as delivered by Jupiter.
-    pub async fn order(&self, request: &OrderRequest) -> RpcResult<OrderResponse> {
+    pub async fn order(&self, request: &OrderRequest) -> IntegrationResult<OrderResponse> {
         let url = format!("{}/order", self.base_url);
 
         let response = self
@@ -75,38 +76,27 @@ impl JupiterClient {
             .query(request)
             .send()
             .await
-            .change_context(RpcError::Network)
+            .change_context(IntegrationError::Network)
             .attach(format!("Failed to call Jupiter {}", url))?;
 
         let status = response.status();
         let body = response
             .text()
             .await
-            .change_context(RpcError::Network)
+            .change_context(IntegrationError::Network)
             .attach("Failed to read Jupiter /order response body")?;
 
         if !status.is_success() {
-            return Err(Report::new(RpcError::Provider)
+            return Err(Report::new(IntegrationError::Provider)
                 .attach(format!("Jupiter /order returned HTTP {}: {}", status, body)));
         }
 
         serde_json::from_str::<OrderResponse>(&body)
-            .change_context(RpcError::Parse)
+            .change_context(IntegrationError::Parse)
             .attach(format!("Failed to parse Jupiter /order response: {}", body))
     }
 
     /// Fetches USD prices and decimals for a batch of mints via Jupiter's Price v3 API.
-    ///
-    /// Mints that Jupiter cannot quote (no liquidity, dead pool, frozen, ...) are
-    /// simply absent from the returned map, so callers can use "present" as a
-    /// signal for "routeable" and "missing" for "likely dead".
-    ///
-    /// Entries are also skipped when Jupiter returns metadata but no `usdPrice`
-    /// (known token without a reliable price) or is missing `decimals` — either
-    /// case leaves the caller unable to compute a USD value and should be treated
-    /// the same as "no price".
-    ///
-    /// Large batches are automatically split to respect the API's 50-mint limit.
     ///
     /// # Parameters
     ///
@@ -115,7 +105,7 @@ impl JupiterClient {
     /// # Returns
     ///
     /// A map from mint to [`PriceInfo`]. Empty on empty input.
-    pub async fn prices(&self, mints: &[Pubkey]) -> RpcResult<HashMap<Pubkey, PriceInfo>> {
+    pub async fn prices(&self, mints: &[Pubkey]) -> IntegrationResult<HashMap<Pubkey, PriceInfo>> {
         if mints.is_empty() {
             return Ok(HashMap::new());
         }
@@ -136,18 +126,18 @@ impl JupiterClient {
                 .query(&[("ids", ids.as_str())])
                 .send()
                 .await
-                .change_context(RpcError::Network)
+                .change_context(IntegrationError::Network)
                 .attach(format!("Failed to call Jupiter {}", self.price_base_url))?;
 
             let status = response.status();
             let body = response
                 .text()
                 .await
-                .change_context(RpcError::Network)
+                .change_context(IntegrationError::Network)
                 .attach("Failed to read Jupiter /price response body")?;
 
             if !status.is_success() {
-                return Err(Report::new(RpcError::Provider)
+                return Err(Report::new(IntegrationError::Provider)
                     .attach(format!("Jupiter /price returned HTTP {}: {}", status, body)));
             }
 
@@ -156,7 +146,7 @@ impl JupiterClient {
             // price — in that case `usdPrice` is absent — so treat "no `usdPrice`"
             // as "no price", identical to the route-failure path downstream.
             let parsed: HashMap<String, PriceEntry> = serde_json::from_str(&body)
-                .change_context(RpcError::Parse)
+                .change_context(IntegrationError::Parse)
                 .attach(format!("Failed to parse Jupiter /price response: {}", body))?;
 
             for (mint_str, entry) in parsed {
@@ -305,34 +295,15 @@ pub struct PlatformFee {
 /// # Parameters
 ///
 /// * `transaction_b64` - The `OrderResponse::transaction` value as returned by Jupiter.
-pub fn decode_transaction(transaction_b64: &str) -> RpcResult<VersionedTransaction> {
+pub fn decode_transaction(transaction_b64: &str) -> IntegrationResult<VersionedTransaction> {
     let bytes = BASE64
         .decode(transaction_b64)
-        .change_context(RpcError::Parse)
+        .change_context(IntegrationError::Parse)
         .attach("Failed to base64-decode Jupiter transaction")?;
 
     bincode::deserialize::<VersionedTransaction>(&bytes)
-        .change_context(RpcError::Parse)
+        .change_context(IntegrationError::Parse)
         .attach("Failed to bincode-deserialize Jupiter transaction")
-}
-
-/// Signs the message of a Jupiter-assembled `VersionedTransaction` with the taker keypair.
-///
-/// Jupiter returns the transaction with placeholder signatures matching the message
-/// header, so rebuilding it through `VersionedTransaction::try_new` replaces them with
-/// real signatures produced by `signer`.
-///
-/// # Parameters
-///
-/// * `transaction` - The decoded transaction returned by [`decode_transaction`].
-/// * `signer` - Keypair that owns the `taker` wallet passed in the order request.
-pub fn sign_transaction(
-    transaction: VersionedTransaction,
-    signer: &Keypair,
-) -> RpcResult<VersionedTransaction> {
-    VersionedTransaction::try_new(transaction.message, &[signer])
-        .change_context(RpcError::Internal)
-        .attach("Failed to sign Jupiter transaction")
 }
 
 /// Fetches a Jupiter order and signs its transaction, returning the ready-to-submit
@@ -356,16 +327,20 @@ pub async fn fetch_signed_swap_transaction(
     client: &JupiterClient,
     request: &OrderRequest,
     signer: &Keypair,
-) -> RpcResult<(VersionedTransaction, OrderResponse)> {
+) -> IntegrationResult<(VersionedTransaction, OrderResponse)> {
     let order = client.order(request).await?;
 
     let transaction_b64 = order.transaction.as_deref().ok_or_else(|| {
-        Report::new(RpcError::Parse)
+        Report::new(IntegrationError::Jupiter)
             .attach("Jupiter /order did not return an assembled transaction; was `taker` provided?")
     })?;
 
     let decoded = decode_transaction(transaction_b64)?;
-    let signed = sign_transaction(decoded, signer)?;
+    // Signing lives in the `rpc` crate so it can be reused by non-Jupiter pipelines;
+    // any RpcError it surfaces is re-tagged into IntegrationError at the boundary.
+    let signed = sign_versioned_transaction(decoded, signer)
+        .change_context(IntegrationError::Internal)
+        .attach("Failed to sign Jupiter transaction")?;
 
     Ok((signed, order))
 }
@@ -393,13 +368,13 @@ pub async fn swap_via_rpc(
     rpc: &RpcClient,
     request: &OrderRequest,
     signer: &Keypair,
-) -> RpcResult<(Signature, OrderResponse)> {
+) -> IntegrationResult<(Signature, OrderResponse)> {
     let (signed_tx, order) = fetch_signed_swap_transaction(jupiter, request, signer).await?;
 
     let signature = rpc
         .send_and_confirm_transaction(&signed_tx)
         .await
-        .change_context(RpcError::Provider)
+        .change_context(IntegrationError::Provider)
         .attach("Failed to confirm Jupiter swap transaction via RPC")?;
 
     Ok((signature, order))
@@ -408,7 +383,7 @@ pub async fn swap_via_rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spl::utils::SOLANA_WRAPPED_MINT as WSOL_MINT;
+    use rpc::spl::utils::SOLANA_WRAPPED_MINT as WSOL_MINT;
     use solana_keypair::Signer;
     use std::sync::OnceLock;
 
@@ -568,7 +543,7 @@ mod tests {
         let Err(err) = decode_transaction("not base64!!!") else {
             panic!("invalid base64 should fail");
         };
-        assert!(matches!(err.current_context(), RpcError::Parse));
+        assert!(matches!(err.current_context(), IntegrationError::Parse));
     }
 
     #[test]
@@ -576,11 +551,11 @@ mod tests {
         let Err(err) = decode_transaction("AQID") else {
             panic!("non-transaction bytes should fail");
         };
-        assert!(matches!(err.current_context(), RpcError::Parse));
+        assert!(matches!(err.current_context(), IntegrationError::Parse));
     }
 
     // Live integration tests hit the real Jupiter API; run with:
-    //     JUP_API_KEY=... cargo test -p rpc -- --ignored --nocapture
+    //     JUP_API_KEY=... cargo test -p integrations -- --ignored --nocapture
     // When `JUP_API_KEY` is unset they return early instead of failing, so
     // `cargo test -- --ignored` stays green on machines without a key.
 

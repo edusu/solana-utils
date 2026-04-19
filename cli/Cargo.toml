@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 rpc                = { path = "../rpc" }
+integrations       = { path = "../integrations" }
 anchor-lang        = { workspace = true }
 solana-keypair     = { workspace = true }
 solana-rpc-client  = { workspace = true }

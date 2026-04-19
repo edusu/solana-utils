@@ -10,6 +10,9 @@ pub enum CliError {
     #[error("RPC error")]
     Rpc,
 
+    #[error("Integration error")]
+    Integration,
+
     #[error("Invalid input")]
     Input,
 }

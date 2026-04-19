@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members  = ["cli", "rpc"]
+members  = ["cli", "integrations", "rpc"]
 
 [workspace.dependencies]
 anchor-client         = { version = "1.0.0 ", features = ["async"] }
