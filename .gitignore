@@ -1,2 +1,9 @@
 /target
 *.env
+
+# AI agent local config
+.claude/
+.agents/
+.cursor/
+.codex/
+.gemini/
